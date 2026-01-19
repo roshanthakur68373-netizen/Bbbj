@@ -1,299 +1,279 @@
-import os, time, sqlite3, requests, re, logging
 from keep_alive import keep_alive
+keep_alive()
+
+import os, sys, json, time, re, subprocess, signal
+import psutil
+
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup
+    Update, ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton
 )
 from telegram.ext import (
     ApplicationBuilder, CommandHandler,
-    CallbackQueryHandler, MessageHandler,
+    MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
 )
+from telegram.request import HTTPXRequest
+from telegram.error import TimedOut
 
-# ================= CONFIG =================
+# ================= CONFIG (ENV) =================
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
-PAYMENTS_GROUP_ID = int(os.getenv("PAYMENTS_GROUP_ID"))
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN env not set")
 
-ETHERSCAN_KEY = os.getenv("ETHERSCAN_KEY")
-BSCSCAN_KEY = os.getenv("BSCSCAN_KEY")
+UPDATES_CHANNEL = os.getenv("UPDATES_CHANNEL", "https://t.me/your_channel")
 
-MIN_USDT = 5.0
-FEE_PERCENT = 2
-EXPIRY_SECONDS = 15 * 60
-# ========================================
+BOT_DIR = "bots"
+LOG_DIR = "logs"
+PID_FILE = "pids.json"
+USER_FILE = "users.json"
 
-logging.basicConfig(level=logging.INFO)
+START_TIME = time.time()
+LAST_UPLOAD_SPEED = 0
 
-USDT_CONTRACTS = {
-    "ERC20": "0xdac17f958d2ee523a2206206994597c13d831ec7",
-    "BEP20": "0x55d398326f99059ff775485246999027b3197955"
-}
+os.makedirs(BOT_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
 
-# ================= DATABASE =================
-db = sqlite3.connect("swap.db", check_same_thread=False)
-cur = db.cursor()
+# ================= STORAGE =================
 
-cur.execute("""CREATE TABLE IF NOT EXISTS deposit (chain TEXT PRIMARY KEY, address TEXT)""")
-cur.execute("""
-CREATE TABLE IF NOT EXISTS orders (
- id INTEGER PRIMARY KEY AUTOINCREMENT,
- user_id INTEGER,
- usdt REAL,
- inr REAL,
- chain TEXT,
- address TEXT,
- tx_hash TEXT,
- tx_link TEXT,
- payout TEXT,
- utr TEXT,
- status TEXT,
- created INTEGER
-)
-""")
-db.commit()
+def load_json(path):
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        return json.load(f)
 
-admin_waiting_utr = {}
+def save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
 
-# ================= HELPERS =================
-def rate():
-    return requests.get(
-        "https://api.coingecko.com/api/v3/simple/price",
-        params={"ids":"tether","vs_currencies":"inr"},
-        timeout=10
-    ).json()["tether"]["inr"]
+PROCESSES = load_json(PID_FILE)
+USERS = load_json(USER_FILE)
 
-def extract_hash(link, chain):
-    p = {
-        "TRC20": r"transaction/([a-fA-F0-9]+)",
-        "ERC20": r"tx/([a-fA-F0-9]+)",
-        "BEP20": r"tx/([a-fA-F0-9]+)"
-    }
-    m = re.search(p[chain], link)
-    return m.group(1) if m else None
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except:
+        return False
 
-def verify_trc20(tx, amt, addr):
-    r = requests.get(
-        f"https://apilist.tronscan.org/api/transaction-info?hash={tx}",
-        timeout=10
-    ).json()
-    for t in r.get("trc20TransferInfo", []):
-        if t["symbol"]=="USDT" and t["to_address"].lower()==addr.lower() and float(t["amount"])==amt:
-            return True
-    return False
-
-def verify_evm(tx, amt, addr, chain):
-    api = "https://api.etherscan.io/api" if chain=="ERC20" else "https://api.bscscan.com/api"
-    key = ETHERSCAN_KEY if chain=="ERC20" else BSCSCAN_KEY
-    r = requests.get(api, params={
-        "module":"account","action":"tokentx","txhash":tx,"apikey":key
-    }).json()
-    for t in r.get("result", []):
-        if t["to"].lower()==addr.lower() and float(t["value"])/(10**int(t["tokenDecimal"]))==amt:
-            return True
-    return False
-
-# ================= TIMER =================
-async def countdown(context):
-    d = context.job.data
-    left = EXPIRY_SECONDS - (int(time.time()) - d["start"])
-
-    if left <= 0:
-        await context.bot.edit_message_text(
-            chat_id=d["chat"],
-            message_id=d["msg"],
-            text="⛔ *Order expired*\nNo transaction received in time.",
-            parse_mode="Markdown"
-        )
-        await context.bot.send_message(
-            ADMIN_ID,
-            f"⛔ ORDER EXPIRED\nUser: {d['user']}\nUSDT: {d['usdt']}\nChain: {d['chain']}"
-        )
-        context.job.schedule_removal()
-        return
-
-    m,s = divmod(left,60)
-    await context.bot.edit_message_text(
-        chat_id=d["chat"],
-        message_id=d["msg"],
-        text=f"⏳ *Time Remaining*\n\n⏱ `{m:02d}:{s:02d}`",
-        parse_mode="Markdown"
-    )
+# cleanup dead processes
+for b, p in list(PROCESSES.items()):
+    if not pid_alive(p):
+        PROCESSES.pop(b)
+save_json(PID_FILE, PROCESSES)
 
 # ================= UI =================
-def menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Swap USDT → INR", callback_data="swap")],
-        [InlineKeyboardButton("📊 My Orders", callback_data="status")],
-        [InlineKeyboardButton("👤 Profile", callback_data="profile")],
-        [InlineKeyboardButton("🆘 Support", callback_data="support")]
-    ])
 
-# ================= START =================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text(
-        "💱 *USDT → INR Swap Service*\n\n"
-        "• Minimum: 5 USDT\n"
-        "• Fee: 2%\n"
-        "• Manual verification\n\n"
-        "Choose an option below:",
-        parse_mode="Markdown",
-        reply_markup=menu()
+def main_menu():
+    return ReplyKeyboardMarkup(
+        [
+            ["📤 Upload", "📂 Check Files"],
+            ["📊 Status", "📢 Updates Channel"]
+        ],
+        resize_keyboard=True
     )
 
-# ================= CALLBACKS =================
-async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+def bot_list_keyboard():
+    bots = [f for f in os.listdir(BOT_DIR) if f.endswith(".py")]
+    if not bots:
+        return None
 
-    if q.data=="swap":
-        context.user_data["step"]="amount"
-        await q.message.edit_text("Enter USDT amount (min 5):")
+    rows = []
+    for b in bots:
+        pid = PROCESSES.get(b)
+        icon = "🟢" if pid and pid_alive(pid) else "🔴"
+        rows.append([
+            InlineKeyboardButton(f"{icon} {b}", callback_data=f"select|{b}")
+        ])
+    return InlineKeyboardMarkup(rows)
 
-    elif q.data in ["TRC20","ERC20","BEP20"]:
-        cur.execute("SELECT address FROM deposit WHERE chain=?", (q.data,))
-        addr = cur.fetchone()[0]
-        context.user_data.update({
-            "chain":q.data,"address":addr,"step":"tx","start":int(time.time())
-        })
+def bot_actions(bot):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("▶ Start", callback_data=f"start|{bot}"),
+            InlineKeyboardButton("⏹ Stop", callback_data=f"stop|{bot}")
+        ],
+        [
+            InlineKeyboardButton("📄 Logs", callback_data=f"logs|{bot}"),
+            InlineKeyboardButton("🗑 Delete", callback_data=f"delete|{bot}")
+        ]
+    ])
 
-        await q.message.edit_text(
-            f"Send *{context.user_data['usdt']} USDT* on *{q.data}*\n\n"
-            f"`{addr}`\n\n"
-            "Then paste the transaction link.",
-            parse_mode="Markdown"
-        )
+# ================= PROCESS =================
 
-        tmsg = await q.message.reply_text("⏳ Timer starting...")
-        job = context.job_queue.run_repeating(
-            countdown,1,data={
-                "chat":q.message.chat_id,
-                "msg":tmsg.message_id,
-                "start":context.user_data["start"],
-                "user":q.from_user.id,
-                "usdt":context.user_data["usdt"],
-                "chain":q.data
-            }
-        )
-        context.user_data["timer"]=job
+def start_bot(bot):
+    log = open(f"{LOG_DIR}/{bot}.log", "a")
+    p = subprocess.Popen(
+        [sys.executable, f"{BOT_DIR}/{bot}"],
+        stdout=log,
+        stderr=log,
+        preexec_fn=os.setsid
+    )
+    PROCESSES[bot] = p.pid
+    save_json(PID_FILE, PROCESSES)
+    return p.pid
 
-    elif q.data=="status":
-        cur.execute("SELECT id,status FROM orders WHERE user_id=?", (q.from_user.id,))
-        rows = cur.fetchall()
-        await q.message.edit_text(
-            "\n".join([f"#{i} → {s}" for i,s in rows]) or "No orders yet.",
-            reply_markup=menu()
-        )
+def stop_bot(bot):
+    pid = PROCESSES.get(bot)
+    if pid:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except:
+            pass
+        PROCESSES.pop(bot, None)
+        save_json(PID_FILE, PROCESSES)
 
-    elif q.data=="profile":
-        cur.execute("SELECT COUNT(*),IFNULL(SUM(usdt),0) FROM orders WHERE user_id=?", (q.from_user.id,))
-        c,s = cur.fetchone()
-        await q.message.edit_text(f"Orders: {c}\nUSDT Swapped: {s}", reply_markup=menu())
+def auto_install(bot):
+    log_path = f"{LOG_DIR}/{bot}.log"
+    if not os.path.exists(log_path):
+        return None
 
-    elif q.data=="support":
-        await q.message.edit_text(
-            "Always send exact amount on correct network.\n"
-            "Orders expire after 15 minutes.",
-            reply_markup=menu()
-        )
+    text = open(log_path).read()
+    m = re.search(r"No module named ['\"]([^'\"]+)['\"]", text)
+    if not m:
+        return None
 
-# ================= MESSAGES =================
-async def msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    step = context.user_data.get("step")
+    module = m.group(1)
+    subprocess.call([sys.executable, "-m", "pip", "install", module])
+    return module
 
-    if step=="amount":
-        usdt = float(update.message.text)
-        if usdt < MIN_USDT:
-            await update.message.reply_text("Minimum is 5 USDT.")
+# ================= ERROR HANDLER =================
+
+async def error_handler(update, context):
+    if isinstance(context.error, TimedOut):
+        print("Telegram timeout handled")
+    else:
+        print(context.error)
+
+# ================= HANDLERS =================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    USERS[uid] = True
+    save_json(USER_FILE, USERS)
+
+    context.user_data.clear()
+    await update.message.reply_text(
+        "🤖 Python Host Bot\nReady to host.",
+        reply_markup=main_menu()
+    )
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global LAST_UPLOAD_SPEED
+    txt = update.message.text
+
+    if txt == "📤 Upload":
+        context.user_data["upload"] = True
+        await update.message.reply_text("Send your `.py` file")
+
+    elif txt == "📂 Check Files":
+        kb = bot_list_keyboard()
+        if not kb:
+            await update.message.reply_text("No bots uploaded.")
             return
+        await update.message.reply_text("Select a bot:", reply_markup=kb)
 
-        r = rate()
-        net = usdt - (usdt*FEE_PERCENT/100)
-        inr = round(net*r,2)
-        context.user_data["usdt"]=usdt
-
+    elif txt == "📢 Updates Channel":
         await update.message.reply_text(
-            f"You will receive approx ₹{inr}",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton(c,callback_data=c)] for c in ["TRC20","ERC20","BEP20"]]
-            )
-        )
-        context.user_data["step"]=None
-
-    elif step=="tx":
-        context.user_data["timer"].schedule_removal()
-        tx = extract_hash(update.message.text, context.user_data["chain"])
-
-        ok = verify_trc20(tx,context.user_data["usdt"],context.user_data["address"]) \
-            if context.user_data["chain"]=="TRC20" else \
-            verify_evm(tx,context.user_data["usdt"],context.user_data["address"],context.user_data["chain"])
-
-        if not ok:
-            await update.message.reply_text("Verification failed.")
-            return
-
-        cur.execute(
-            "INSERT INTO orders VALUES (NULL,?,?,?,?,?,?,?,?,?,?)",
-            (update.message.from_user.id,context.user_data["usdt"],0,
-             context.user_data["chain"],context.user_data["address"],
-             tx,update.message.text,"UPI",None,"pending",int(time.time()))
-        )
-        db.commit()
-
-        oid = cur.lastrowid
-
-        await context.bot.send_message(
-            ADMIN_ID,
-            f"🆕 New Order #{oid}\nUSDT: {context.user_data['usdt']}",
+            "Updates:",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Approve",callback_data=f"a_{oid}"),
-                 InlineKeyboardButton("❌ Reject",callback_data=f"r_{oid}")]
+                [InlineKeyboardButton("Open Channel", url=UPDATES_CHANNEL)]
             ])
         )
 
-        await update.message.reply_text("Order submitted.", reply_markup=menu())
-        context.user_data.clear()
-
-# ================= ADMIN =================
-async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    act,oid = q.data.split("_")
-    oid=int(oid)
-
-    if act=="a":
-        admin_waiting_utr[q.from_user.id]=oid
-        await q.message.edit_text("Send UTR or type `skip`",parse_mode="Markdown")
-    else:
-        cur.execute("UPDATE orders SET status='rejected' WHERE id=?", (oid,))
-        db.commit()
-        await q.message.edit_text("Rejected.")
-
-async def admin_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.from_user.id in admin_waiting_utr:
-        oid = admin_waiting_utr.pop(update.from_user.id)
-        utr = update.message.text if update.message.text.lower()!="skip" else None
-
-        cur.execute("UPDATE orders SET status='approved',utr=? WHERE id=?", (utr,oid))
-        db.commit()
-
-        await context.bot.send_message(
-            PAYMENTS_GROUP_ID,
-            f"✅ Order #{oid} completed\nUTR: {utr or 'N/A'}"
+    elif txt == "📊 Status":
+        active = sum(1 for p in PROCESSES.values() if pid_alive(p))
+        await update.message.reply_text(
+            f"👥 Users: {len(USERS)}\n"
+            f"📁 Files: {len(os.listdir(BOT_DIR))}\n"
+            f"🟢 Active Bots: {active}\n"
+            f"⚡ Last Upload Speed: {LAST_UPLOAD_SPEED} ms"
         )
 
-        await update.message.reply_text("Approved.")
+async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global LAST_UPLOAD_SPEED
 
-# ================= RUN =================
+    if not context.user_data.get("upload"):
+        return
+
+    doc = update.message.document
+    if not doc.file_name.endswith(".py"):
+        await update.message.reply_text("Only .py files allowed.")
+        return
+
+    start_t = time.time()
+    msg = await update.message.reply_text("⏳ Processing...")
+    file = await doc.get_file()
+    await file.download_to_drive(f"{BOT_DIR}/{doc.file_name}")
+
+    pid = start_bot(doc.file_name)
+    LAST_UPLOAD_SPEED = round((time.time() - start_t) * 1000, 2)
+
+    context.user_data.clear()
+    await msg.edit_text(
+        f"✅ Started\nBot: `{doc.file_name}`\nPID: `{pid}`\nSpeed: {LAST_UPLOAD_SPEED} ms",
+        parse_mode="Markdown"
+    )
+
+async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    action, bot = q.data.split("|", 1)
+
+    if action == "select":
+        await q.message.reply_text(
+            f"⚙ {bot}",
+            reply_markup=bot_actions(bot)
+        )
+
+    elif action == "start":
+        pid = start_bot(bot)
+        await q.message.reply_text(f"▶ Started `{pid}`", parse_mode="Markdown")
+
+    elif action == "stop":
+        stop_bot(bot)
+        await q.message.reply_text("⏹ Stopped")
+
+    elif action == "logs":
+        mod = auto_install(bot)
+        if mod:
+            pid = start_bot(bot)
+            await q.message.reply_text(
+                f"📦 Installed `{mod}` → Restarted `{pid}`",
+                parse_mode="Markdown"
+            )
+            return
+
+        log = f"{LOG_DIR}/{bot}.log"
+        txt = "".join(open(log).readlines()[-25:]) if os.path.exists(log) else "No logs"
+        await q.message.reply_text(txt)
+
+    elif action == "delete":
+        stop_bot(bot)
+        os.remove(f"{BOT_DIR}/{bot}")
+        await q.message.reply_text("🗑 Deleted")
+
+# ================= MAIN =================
+
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(admin, pattern="^[ar]_"))
-    app.add_handler(CallbackQueryHandler(cb))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_msg))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg))
-    app.run_polling(drop_pending_updates=True)
+    request = HTTPXRequest(
+        connect_timeout=20,
+        read_timeout=20,
+        write_timeout=20,
+        pool_timeout=20
+    )
 
-if __name__=="__main__":
-    keep_alive()
+    app = ApplicationBuilder().token(BOT_TOKEN).request(request).build()
+
+    app.add_handler(CallbackQueryHandler(callbacks))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.Document.ALL, file_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    app.add_error_handler(error_handler)
+
+    print("✅ Host Bot running on Render (Flask + ENV)")
+    app.run_polling()
+
+if __name__ == "__main__":
     main()
